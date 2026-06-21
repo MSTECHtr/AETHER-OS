@@ -1,0 +1,12 @@
+[Unit]
+Description=Aether USB Key Check
+Before=ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aether-usb-guard
+StandardOutput=journal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

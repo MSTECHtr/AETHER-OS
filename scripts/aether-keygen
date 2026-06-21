@@ -1,0 +1,10 @@
+#!/bin/bash
+# 24 karakter, max 7 rakam, gerisi harf (a-zA-Z), pozisyonlar rastgele
+while true; do
+    key=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 24)
+    digits=$(echo "$key" | grep -o '[0-9]' | wc -l)
+    if [ "$digits" -le 7 ]; then
+        echo "$key"
+        break
+    fi
+done

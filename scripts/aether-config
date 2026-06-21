@@ -1,0 +1,294 @@
+#!/bin/bash
+
+CONF="/etc/aether-usb.conf"
+TICKET="/tmp/aether-ticket"
+TIMEOUT=300
+
+# --- Yardımcı fonksiyonlar ---
+require_key() {
+    if [ -f "$TICKET" ]; then
+        local now=$(date +%s)
+        local mtime=$(stat -c %Y "$TICKET")
+        if [ $((now - mtime)) -lt $TIMEOUT ]; then
+            return 0
+        fi
+    fi
+    # USB anahtar kontrolü
+    source "$CONF"
+    if [ -z "$USB_UUID" ] || [ -z "$AETHER_KEY_HASH" ]; then
+        echo "HATA: USB anahtarı tanımlanmamış. Önce USB ayarlarını yapın (menü 1)."
+        return 1
+    fi
+    if /usr/local/bin/aether-usb-guard; then
+        touch "$TICKET"
+        chmod 600 "$TICKET"
+        return 0
+    else
+        echo "USB anahtar doğrulanamadı! İşlem iptal edildi."
+        return 1
+    fi
+}
+
+invalidate_ticket() {
+    rm -f "$TICKET"
+}
+
+# --- Menü başlıkları ---
+menu_main() {
+    clear
+    echo "========================================="
+    echo "       Aether OS Yapılandırma Menüsü"
+    echo "========================================="
+    echo "1. USB Anahtar Yönetimi"
+    echo "2. Sistem Kilidi (Değişiklikleri Engelle)"
+    echo "3. Paket Yöneticisi (APT) Kontrolü"
+    echo "4. Güvenlik Duvarı Ayarları"
+    echo "5. SSH Ayarları"
+    echo "6. Sistem Bütünlük Kontrolü"
+    echo "7. Çıkış"
+    read -p "Seçiminiz: " choice
+    case $choice in
+        1) menu_usb ;;
+        2) toggle_system_lock ;;
+        3) menu_apt ;;
+        4) menu_firewall ;;
+        5) menu_ssh ;;
+        6) run_integrity_check ;;
+        7) exit 0 ;;
+        *) echo "Geçersiz seçim"; sleep 1; menu_main ;;
+    esac
+}
+
+# ---------- 1. USB Anahtar Yönetimi ----------
+menu_usb() {
+    clear
+    echo "--- USB Anahtar Yönetimi ---"
+    echo "1. Yeni USB Tanımla / UUID Kaydet"
+    echo "2. Yeni Anahtar Oluştur ve USB'ye Yaz"
+    echo "3. USB'deki Anahtarı Sil"
+    echo "4. Anahtar Gereksinimini Geçici Kapat (Acil Durum)"
+    echo "5. Ana Menüye Dön"
+    read -p "Seçim: " opt
+    case $opt in
+        1) set_usb_uuid ;;
+        2) gen_and_write_key ;;
+        3) delete_key_from_usb ;;
+        4) disable_guard_temporarily ;;
+        5) menu_main ;;
+        *) echo "Geçersiz"; sleep 1; menu_usb ;;
+    esac
+}
+
+set_usb_uuid() {
+    require_key || { read -p "Devam etmek için Enter..."; menu_usb; return; }
+    echo "Takılı USB aygıtları:"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,LABEL,UUID | grep disk
+    read -p "Kullanmak istediğiniz USB'nin UUID'sini girin: " uuid
+    sed -i "s/^USB_UUID=.*/USB_UUID=\"$uuid\"/" "$CONF"
+    echo "UUID güncellendi."
+    invalidate_ticket
+    read -p "Enter..."; menu_usb
+}
+
+gen_and_write_key() {
+    require_key || { read -p "Devam etmek için Enter..."; menu_usb; return; }
+    source "$CONF"
+    if [ -z "$USB_UUID" ]; then
+        echo "Önce USB UUID tanımlanmalı!"
+        read -p "Enter..."; menu_usb; return
+    fi
+    new_key=$(aether-keygen)
+    new_hash=$(echo -n "$new_key" | sha256sum | cut -d' ' -f1)
+    # USB'ye yaz
+    mnt="/mnt/aether-usb"
+    mkdir -p "$mnt"
+    device=$(blkid -U "$USB_UUID" 2>/dev/null)
+    if mount "$device" "$mnt" 2>/dev/null; then
+        echo "$new_key" > "$mnt/aether_key"
+        umount "$mnt"
+        # Config'e hash'i yaz
+        sed -i "s/^AETHER_KEY_HASH=.*/AETHER_KEY_HASH=\"$new_hash\"/" "$CONF"
+        echo "Anahtar USB'ye yazıldı ve sistem hash güncellendi."
+        echo "Yeni anahtar: $new_key  (NOT: bunu bir yere kaydedin, USB kaybolursa bu anahtar olmadan erişim zorlaşır)"
+    else
+        echo "USB mount edilemedi!"
+    fi
+    invalidate_ticket
+    read -p "Enter..."; menu_usb
+}
+
+delete_key_from_usb() {
+    require_key || { read -p "Devam etmek için Enter..."; menu_usb; return; }
+    source "$CONF"
+    mnt="/mnt/aether-usb"
+    mkdir -p "$mnt"
+    device=$(blkid -U "$USB_UUID" 2>/dev/null)
+    if mount "$device" "$mnt" 2>/dev/null; then
+        rm -f "$mnt/aether_key"
+        umount "$mnt"
+        echo "USB'deki anahtar silindi."
+    else
+        echo "USB mount edilemedi!"
+    fi
+    invalidate_ticket
+    read -p "Enter..."; menu_usb
+}
+
+disable_guard_temporarily() {
+    require_key || { read -p "Devam etmek için Enter..."; menu_usb; return; }
+    echo "UYARI: Bu işlem SSH'in USB olmadan başlamasına izin verir."
+    read -p "Emin misiniz? (yes/no): " onay
+    if [ "$onay" == "yes" ]; then
+        systemctl disable aether-usb-guard.service
+        echo "Guard devre dışı. Tekrar etkinleştirmek için: systemctl enable aether-usb-guard"
+    fi
+    invalidate_ticket
+    read -p "Enter..."; menu_usb
+}
+
+# ---------- 2. Sistem Kilidi ----------
+toggle_system_lock() {
+    require_key || { read -p "Enter..."; menu_main; return; }
+    if grep -q "^Immutable=yes" /etc/aether-lock.conf 2>/dev/null; then
+        # Şu an kilitli, kilidi kaldır
+        sed -i 's/^Immutable=yes/Immutable=no/' /etc/aether-lock.conf
+        echo "Sistem kilidi kaldırıldı. Artık değişiklik yapılabilir."
+        # Tüm önemli dosyalardan chattr +i kaldırılabilir (opsiyonel)
+    else
+        # Kilit yoksa etkinleştir
+        mkdir -p /etc
+        echo "Immutable=yes" > /etc/aether-lock.conf
+        echo "Sistem kilitlendi. Artık kritik dosyalar değiştirilemez."
+        # İstenirse /etc/aether-usb.conf, /etc/ssh/sshd_config gibi dosyalara chattr +i yapılabilir
+        chattr +i /etc/aether-usb.conf
+        chattr +i /etc/ssh/sshd_config
+        # ... vb.
+    fi
+    invalidate_ticket
+    read -p "Enter..."; menu_main
+}
+
+# ---------- 3. APT Kontrolü ----------
+menu_apt() {
+    clear
+    echo "--- APT Paket Yöneticisi Kontrolü ---"
+    echo "1. Paket Kurulumunu Etkinleştir"
+    echo "2. Paket Kurulumunu Kapat (Yalnızca Güvenlik Güncellemeleri)"
+    echo "3. Ana Menü"
+    read -p "Seçim: " opt
+    case $opt in
+        1) enable_apt ;;
+        2) disable_apt ;;
+        3) menu_main ;;
+        *) echo "Geçersiz"; sleep 1; menu_apt ;;
+    esac
+}
+
+enable_apt() {
+    require_key || { read -p "Enter..."; menu_apt; return; }
+    mv /etc/apt/sources.list.disabled /etc/apt/sources.list 2>/dev/null
+    mv /etc/apt/sources.list.d/disabled/* /etc/apt/sources.list.d/ 2>/dev/null
+    echo "APT etkinleştirildi."
+    invalidate_ticket
+    read -p "Enter..."; menu_apt
+}
+
+disable_apt() {
+    require_key || { read -p "Enter..."; menu_apt; return; }
+    mkdir -p /etc/apt/sources.list.d/disabled
+    mv /etc/apt/sources.list /etc/apt/sources.list.disabled 2>/dev/null
+    mv /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/disabled/ 2>/dev/null
+    echo "APT devre dışı bırakıldı. Sadece güvenlik güncellemeleri (unattended-upgrades) çalışır."
+    invalidate_ticket
+    read -p "Enter..."; menu_apt
+}
+
+# ---------- 4. Güvenlik Duvarı ----------
+menu_firewall() {
+    clear
+    echo "--- Güvenlik Duvarı (nftables) ---"
+    echo "1. Kuralları Göster"
+    echo "2. SSH Portunu Değiştir"
+    echo "3. Ana Menü"
+    read -p "Seçim: " opt
+    case $opt in
+        1) nft list ruleset | less ;;
+        2) change_ssh_port ;;
+        3) menu_main ;;
+        *) echo "Geçersiz"; sleep 1; menu_firewall ;;
+    esac
+}
+
+change_ssh_port() {
+    require_key || { read -p "Enter..."; menu_firewall; return; }
+    read -p "Yeni SSH portunu girin: " newport
+    # nftables dosyasını güncelle
+    sed -i "s/tcp dport [0-9]*/tcp dport $newport/" /etc/nftables.conf
+    # sshd_config güncelle
+    sed -i "s/^Port .*/Port $newport/" /etc/ssh/sshd_config
+    systemctl restart ssh nftables 2>/dev/null || true
+    echo "SSH portu $newport olarak değiştirildi."
+    invalidate_ticket
+    read -p "Enter..."; menu_firewall
+}
+
+# ---------- 5. SSH Ayarları ----------
+menu_ssh() {
+    clear
+    echo "--- SSH Yönetimi ---"
+    echo "1. İzin Verilen Kullanıcıyı Değiştir"
+    echo "2. Yeni SSH Anahtarı Ekle (aetheruser)"
+    echo "3. Ana Menü"
+    read -p "Seçim: " opt
+    case $opt in
+        1) change_ssh_user ;;
+        2) add_ssh_pubkey ;;
+        3) menu_main ;;
+        *) echo "Geçersiz"; sleep 1; menu_ssh ;;
+    esac
+}
+
+change_ssh_user() {
+    require_key || { read -p "Enter..."; menu_ssh; return; }
+    read -p "İzin verilecek yeni kullanıcı adı: " newuser
+    id -u "$newuser" &>/dev/null || { echo "Kullanıcı yok."; read -p "Enter..."; menu_ssh; return; }
+    sed -i "s/^AllowUsers .*/AllowUsers $newuser/" /etc/ssh/sshd_config
+    systemctl restart sshd 2>/dev/null || true
+    echo "SSH artık sadece $newuser kullanıcısına izin veriyor."
+    invalidate_ticket
+    read -p "Enter..."; menu_ssh
+}
+
+add_ssh_pubkey() {
+    require_key || { read -p "Enter..."; menu_ssh; return; }
+    read -p "Kullanıcı adı (varsayılan: aetheruser): " user
+    user=${user:-aetheruser}
+    if [ ! -d "/home/$user/.ssh" ]; then
+        echo "Kullanıcı yok veya SSH ayarları eksik."
+        read -p "Enter..."; menu_ssh; return
+    fi
+    echo "Yeni public key'i yapıştırın (tek satır, ardından Ctrl+D):"
+    newkey=$(cat)
+    echo "$newkey" >> "/home/$user/.ssh/authorized_keys"
+    chown "$user:$user" "/home/$user/.ssh/authorized_keys"
+    chmod 600 "/home/$user/.ssh/authorized_keys"
+    echo "Anahtar eklendi."
+    invalidate_ticket
+    read -p "Enter..."; menu_ssh
+}
+
+# ---------- 6. Bütünlük Kontrolü ----------
+run_integrity_check() {
+    require_key || { read -p "Enter..."; menu_main; return; }
+    echo "AIDE bütünlük kontrolü başlatılıyor..."
+    aide --check
+    read -p "Enter..."; menu_main
+}
+
+# --- Başlangıç ---
+if [[ $EUID -ne 0 ]]; then
+    echo "Bu program root olarak çalıştırılmalı."
+    exit 1
+fi
+
+menu_main

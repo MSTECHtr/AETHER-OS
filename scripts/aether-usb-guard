@@ -1,0 +1,32 @@
+#!/bin/bash
+
+CONF="/etc/aether-usb.conf"
+if [ ! -f "$CONF" ]; then
+    exit 1
+fi
+source "$CONF"
+
+if [ -z "$USB_UUID" ] || [ -z "$AETHER_KEY_HASH" ]; then
+    exit 1
+fi
+
+device=$(blkid -U "$USB_UUID" 2>/dev/null)
+if [ -z "$device" ]; then
+    exit 1
+fi
+
+mnt="/mnt/aether-usb"
+mkdir -p "$mnt"
+mount "$device" "$mnt" 2>/dev/null || exit 1
+
+if [ -f "$mnt/aether_key" ]; then
+    usb_key=$(head -n 1 "$mnt/aether_key" | tr -d '\n')
+    computed_hash=$(echo -n "$usb_key" | sha256sum | cut -d' ' -f1)
+    if [ "$computed_hash" == "$AETHER_KEY_HASH" ]; then
+        umount "$mnt"
+        exit 0
+    fi
+fi
+
+umount "$mnt"
+exit 1
